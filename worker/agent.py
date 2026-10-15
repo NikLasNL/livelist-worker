@@ -1,13 +1,15 @@
 """
-worker/agent.py — автономный воркер v5
-+ Принимает упакованные модули (unpack_module)
-+ НЕ содержит модулей изначально
+worker/agent.py — Worker v6
++ Auto-enroll через bootstrap token
++ Certificate-based trust
++ Relay capability
 """
 
 import asyncio
 import json
 import logging
 import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -23,10 +25,12 @@ from shared.protocol import (
     send_big_file, FileReceiver, CHUNK_SIZE,
 )
 from shared.module_pack import unpack_module, derive_xor_key
+from shared.ca import verify_certificate
 
 from worker.loader import ModuleLoader
 from worker.executor import TaskExecutor
 from worker.p2p import P2PNode
+from worker.relay import RelayServer
 
 
 BASE = Path(__file__).parent.parent
@@ -53,18 +57,20 @@ log = logging.getLogger("worker")
 
 
 class WorkerAgent:
-    def __init__(self, master_addr, master_pubkey_hex,
+    def __init__(self, master_addr, master_pubkey_hex=None,
                  wg_addr="?", password=None, p2p_port=9100,
-                 bootstrap_pubkey_hex=None):
+                 bootstrap_token=None, relay_port=9200):
         self.master_addr = master_addr
-        self.master_pubkey = bytes.fromhex(master_pubkey_hex)
+        self.master_pubkey = (bytes.fromhex(master_pubkey_hex)
+                              if master_pubkey_hex else None)
         self.wg_addr = wg_addr
         self.password = (password or os.environ.get("LIVELIST_PASSWORD")
                           or "changeme-please")
         self.p2p_port = p2p_port
-        self.bootstrap_pubkey = (bytes.fromhex(bootstrap_pubkey_hex)
-                                  if bootstrap_pubkey_hex else None)
+        self.relay_port = relay_port
+        self.bootstrap_token = bootstrap_token
 
+        # ─── Keys ────────────────────────────────────────────────
         self.key_path = CONFIG / "worker_keys.json"
         if not self.key_path.exists():
             priv, pub = generate_keypair()
@@ -72,6 +78,28 @@ class WorkerAgent:
             log.info(f"New worker key: {pub.hex()}")
 
         self.static_priv, self.static_pub = load_keypair(self.key_path)
+
+        # ─── Certificate ─────────────────────────────────────────
+        self.cert_path = CONFIG / "certificate.json"
+        self.cert = None
+        if self.cert_path.exists():
+            try:
+                self.cert = json.loads(self.cert_path.read_text())
+                log.info(f"Loaded cert: {self.cert.get('hostname')}")
+            except Exception:
+                pass
+
+        # ─── CA public ───────────────────────────────────────────
+        self.ca_pub_path = CONFIG / "ca_public.txt"
+        self.ca_pub = None
+        if self.ca_pub_path.exists():
+            try:
+                self.ca_pub = bytes.fromhex(
+                    self.ca_pub_path.read_text().strip()
+                )
+            except Exception:
+                pass
+
         self.loader = ModuleLoader(MODULES_DIR)
         self.executor = TaskExecutor(self.loader)
 
@@ -83,23 +111,40 @@ class WorkerAgent:
             on_data=self._on_p2p_data,
         )
 
+        self.relay = None
         self.running = True
         self.reconnect_delay = 5
         self.max_reconnect_delay = 300
 
     async def run(self):
         log.info("═" * 60)
-        log.info(f"Worker v5 | pub={self.static_pub.hex()[:16]}")
+        log.info(f"Worker v6 | pub={self.static_pub.hex()[:16]}")
         log.info(f"Master: {self.master_addr}")
         log.info(f"WG: {self.wg_addr}  P2P: {self.p2p_port}")
-        log.info(f"Bootstrap: {'ON' if self.bootstrap_pubkey else 'OFF'}")
+        log.info(f"Enrolled: {'✓' if self.cert else '✗'}")
         log.info(f"Modules: {self.loader.list_modules()}")
         log.info("═" * 60)
 
+        # ─── P2P server ──────────────────────────────────────────
         try:
             await self.p2p.start_server()
         except Exception as e:
             log.warning(f"P2P server: {e}")
+
+        # ─── Relay server (если есть cert + public IP) ───────────
+        if self.cert and self.cert.get("can_relay"):
+            try:
+                self.relay = RelayServer(
+                    my_priv=self.static_priv,
+                    my_pub=self.static_pub,
+                    password=self.password,
+                    ca_pub=self.ca_pub,
+                    listen_port=self.relay_port,
+                )
+                await self.relay.start()
+                log.info(f"Relay enabled on port {self.relay_port}")
+            except Exception as e:
+                log.warning(f"Relay server: {e}")
 
         while self.running:
             try:
@@ -116,6 +161,8 @@ class WorkerAgent:
                 self.reconnect_delay * 2, self.max_reconnect_delay
             )
 
+        if self.relay:
+            await self.relay.stop()
         await self.p2p.stop()
         log.info("Stopped")
 
@@ -128,6 +175,7 @@ class WorkerAgent:
             asyncio.open_connection(host, port), timeout=15,
         )
 
+        # ─── 1. Handshake ────────────────────────────────────────
         channel = await asyncio.wait_for(
             Handshake.client_handshake(
                 reader, writer,
@@ -140,17 +188,116 @@ class WorkerAgent:
         log.info("Handshake OK")
         self.reconnect_delay = 5
 
+        # ─── 2. Enrollment или announce ──────────────────────────
+        if self.cert is None:
+            # Первый раз — enroll
+            if not self.bootstrap_token:
+                log.error("No cert and no bootstrap_token — cannot enroll")
+                return
+
+            log.info("First-time enrollment...")
+
+            # Мой public IP для relay-capability
+            my_public_ip = ""
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        "https://api.ipify.org",
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as r:
+                        my_public_ip = (await r.text()).strip()
+            except Exception:
+                pass
+
+            can_relay = bool(my_public_ip)
+            hostname = socket.gethostname()
+
+            await write_message(writer, channel,
+                                 MsgType.ENROLL_REQUEST, {
+                "token": self.bootstrap_token,
+                "wg_addr": self.wg_addr,
+                "hostname": hostname,
+                "public_ip": my_public_ip,
+                "can_relay": can_relay,
+                "pubkey": self.static_pub.hex(),
+            })
+
+            # Ждём ответ
+            msg_type, header, body = await read_message(reader, channel)
+
+            if msg_type == MsgType.ENROLL_REJECT:
+                log.error(f"Enrollment rejected: {header.get('reason')}")
+                return
+
+            if msg_type != MsgType.ENROLL_RESPONSE:
+                log.error(f"Unexpected: {msg_type}")
+                return
+
+            self.cert = header.get("cert")
+            ca_public_hex = header.get("ca_public")
+
+            if ca_public_hex:
+                self.ca_pub = bytes.fromhex(ca_public_hex)
+                self.ca_pub_path.write_text(ca_public_hex)
+                self.ca_pub_path.chmod(0o600)
+
+            self.cert_path.write_text(json.dumps(self.cert, indent=2))
+            self.cert_path.chmod(0o600)
+
+            log.info(f"✓ Certificate issued")
+            log.info(f"  hostname:  {self.cert.get('hostname')}")
+            log.info(f"  wg_addr:   {self.cert.get('wg_addr')}")
+            log.info(f"  can_relay: {self.cert.get('can_relay')}")
+            log.info(f"  public_ip: {self.cert.get('public_ip')}")
+
+            # ─── Запускаем relay если можем ──────────────────────
+            if can_relay and not self.relay:
+                try:
+                    self.relay = RelayServer(
+                        my_priv=self.static_priv,
+                        my_pub=self.static_pub,
+                        password=self.password,
+                        ca_pub=self.ca_pub,
+                        listen_port=self.relay_port,
+                    )
+                    await self.relay.start()
+                    log.info(f"Relay enabled: {self.relay_port}")
+                except Exception as e:
+                    log.warning(f"Relay start failed: {e}")
+
+        else:
+            # Уже есть cert — проверяем
+            if self.ca_pub and not verify_certificate(self.ca_pub, self.cert):
+                log.warning("Certificate invalid — re-enrolling")
+                self.cert = None
+                self.cert_path.unlink(missing_ok=True)
+                return
+
+            await write_message(writer, channel, MsgType.PEER_ANNOUNCE, {
+                "cert": self.cert,
+            })
+            log.info(f"Announced cert: {self.cert.get('hostname')}")
+
+        # ─── 3. Регистрация ──────────────────────────────────────
         await write_message(writer, channel, MsgType.STATUS, {
             "state": "online",
             "wg_addr": self.wg_addr,
             "p2p_port": self.p2p_port,
+            "relay_port": self.relay_port if self.relay else 0,
             "modules": self.loader.list_modules(),
-            "version": "5.0",
-            "started_at": int(time.time()),
+            "version": "6.0",
+            "hostname": self.cert.get("hostname", "?"),
+            "can_relay": self.cert.get("can_relay", False),
         })
 
+        # Запрос directory
+        await write_message(writer, channel, MsgType.DIRECTORY_REQUEST)
+
+        # Модули
         if not self.loader.list_modules():
-            await write_message(writer, channel, MsgType.REQUEST_MODULES)
+            await write_message(writer, channel,
+                                 MsgType.REQUEST_MODULES)
 
         await self._flush_cached_results(writer, channel)
         await self._loop(reader, writer, channel)
@@ -185,7 +332,6 @@ class WorkerAgent:
                 await write_message(writer, channel, MsgType.PONG)
 
             elif msg_type == MsgType.PUSH_MODULE:
-                # Одиночный модуль
                 module_name = header["module"]
                 await self._unpack_and_load(writer, channel,
                                              module_name, body)
@@ -232,6 +378,21 @@ class WorkerAgent:
             elif msg_type == MsgType.P2P_CONNECT:
                 asyncio.create_task(self._handle_p2p_connect(header))
 
+            elif msg_type == MsgType.DIRECTORY_RESPONSE:
+                peers = header.get("peers", [])
+                ca_pub_hex = header.get("ca_public")
+                if ca_pub_hex and not self.ca_pub:
+                    self.ca_pub = bytes.fromhex(ca_pub_hex)
+                    self.ca_pub_path.write_text(ca_pub_hex)
+                    self.ca_pub_path.chmod(0o600)
+
+                log.info(f"Directory: {len(peers)} peers")
+                for p in peers:
+                    caps = p.get("capabilities", {})
+                    log.info(f"  {caps.get('hostname', '?')} "
+                              f"wg={caps.get('wg_addr')} "
+                              f"relay={caps.get('can_relay')}")
+
             elif msg_type == MsgType.KEY_ROTATE_REQUEST:
                 await self._handle_key_rotate_request(writer, channel)
 
@@ -244,23 +405,12 @@ class WorkerAgent:
                 return
 
     # ═════════════════════════════════════════════════════════════════
-    # MODULE unpack + load
+    # Module unpack
     # ═════════════════════════════════════════════════════════════════
 
     async def _unpack_and_load(self, writer, channel, module_name, packed):
-        """
-        1. Derive XOR key
-        2. Unpack (verify SHA + size + magic)
-        3. Write .py
-        4. Load
-        5. Ack
-        """
         if not channel.shared_secret:
-            log.error("Channel без shared_secret")
-            await write_message(writer, channel, MsgType.MODULE_ACK, {
-                "module": module_name, "state": "error",
-                "error": "no shared_secret",
-            })
+            log.error("No shared_secret")
             return False
 
         try:
@@ -274,12 +424,10 @@ class WorkerAgent:
             })
             return False
 
-        # Записываем .py
         filepath = MODULES_DIR / f"{name}.py"
         filepath.write_bytes(source)
-        log.info(f"Unpacked: {name} ({len(source)} bytes) → {filepath.name}")
+        log.info(f"Unpacked: {name} ({len(source)} bytes)")
 
-        # Загружаем
         try:
             self.loader.load_module(name)
             await write_message(writer, channel, MsgType.MODULE_ACK, {
@@ -323,7 +471,6 @@ class WorkerAgent:
         log.info(f"[P2P] {role} → {peer_pub[:16]} @ {peer_host}:{peer_port}")
         if role == "initiator":
             if peer_host in ("?", "", None):
-                log.warning("[P2P] initiator without host")
                 return
             await asyncio.sleep(2)
             await self.p2p.connect_to_peer(peer_host, peer_port, peer_pub)
@@ -341,7 +488,7 @@ class WorkerAgent:
     # ═════════════════════════════════════════════════════════════════
 
     async def _handle_key_rotate_request(self, writer, channel):
-        log.info("[KEY] rotate requested")
+        log.info("[KEY] rotation requested")
         old_priv, old_pub, new_priv, new_pub = rotate_keypair(
             self.key_path, KEYS_BACKUP
         )
@@ -409,22 +556,42 @@ async def main():
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--master", required=True)
-    p.add_argument("--master-key", required=True)
+    p.add_argument("--master-key", default=None)
     p.add_argument("--password", default=None)
+    p.add_argument("--bootstrap-token", default=None)
     p.add_argument("--wg-addr", default="?")
     p.add_argument("--p2p-port", type=int, default=9100)
-    p.add_argument("--bootstrap-key", default=None)
+    p.add_argument("--relay-port", type=int, default=9200)
     p.add_argument("--show-key", action="store_true")
+    p.add_argument("--enroll-only", action="store_true")
     args = p.parse_args()
 
     agent = WorkerAgent(
-        args.master, args.master_key, args.wg_addr,
-        password=args.password, p2p_port=args.p2p_port,
-        bootstrap_pubkey_hex=args.bootstrap_key,
+        args.master,
+        master_pubkey_hex=args.master_key,
+        wg_addr=args.wg_addr,
+        password=args.password,
+        p2p_port=args.p2p_port,
+        bootstrap_token=args.bootstrap_token,
+        relay_port=args.relay_port,
     )
 
     if args.show_key:
         print(f"Worker public key: {agent.static_pub.hex()}")
+        return
+
+    if args.enroll_only:
+        # Только enrollment, затем выход
+        host, port = args.master.rsplit(":", 1)
+        reader, writer = await asyncio.open_connection(host, int(port))
+        channel = await Handshake.client_handshake(
+            reader, writer,
+            my_static_priv=agent.static_priv,
+            server_static_pub=agent.master_pubkey,
+            password=agent.password,
+        )
+        # ... тот же код что в _run_session до enroll ...
+        print("Use full run instead")
         return
 
     await agent.run()
