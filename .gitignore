@@ -1,0 +1,24 @@
+# Ключи (генерируются автоматически при деплое)
+config/worker_keys.json
+config/master_pubkey.txt
+config/keys_backup/
+config/*.txt
+
+# Модули (приходят от мастера)
+worker_modules/*.py
+!worker_modules/.gitkeep
+
+# Результаты
+task_results/
+logs/
+*.log
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Env
+.env
+.livelist_*
