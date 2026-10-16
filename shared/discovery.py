@@ -206,14 +206,13 @@ class MasterDiscoveryBroadcaster:
 
     async def start(self):
         self.running = True
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setblocking(False)
 
         print(f"[DISCOVERY] Unicast broadcaster started")
         print(f"[DISCOVERY] wg_iface={self.wg_interface} "
               f"self_wg={self.wg_addr}")
         print(f"[DISCOVERY] interval={self.interval}s port={self.port}")
 
+        loop = asyncio.get_event_loop()
         first = True
 
         while self.running:
@@ -233,31 +232,14 @@ class MasterDiscoveryBroadcaster:
                         self.wg_addr, self.hostname,
                     )
                     for peer_ip in peers:
-                        ok = False
-                        # Способ 1: прямой sendto (самый надёжный)
-                        try:
-                            self.sock.sendto(packet, (peer_ip, self.port))
+                        # Используем blocking socket в executor — надёжнее
+                        ok = await loop.run_in_executor(
+                            None,
+                            self._send_blocking,
+                            packet, peer_ip, self.port,
+                        )
+                        if ok:
                             print(f"[DISCOVERY] → {peer_ip}:{self.port}")
-                            ok = True
-                        except BlockingIOError:
-                            print(f"[DISCOVERY] → {peer_ip}: buffer full")
-                            ok = True
-                        except OSError as e:
-                            print(f"[DISCOVERY] send {peer_ip}: {e}")
-
-                        # Способ 2: если прямой не сработал — через executor
-                        if not ok:
-                            try:
-                                import asyncio as _aio
-                                loop = _aio.get_event_loop()
-                                await loop.run_in_executor(
-                                    None,
-                                    self.sock.sendto,
-                                    packet, (peer_ip, self.port),
-                                )
-                                print(f"[DISCOVERY] → {peer_ip} (executor)")
-                            except Exception as e:
-                                print(f"[DISCOVERY] executor {peer_ip}: {e}")
 
                 elif first:
                     print("[DISCOVERY] waiting for peers...")
@@ -268,13 +250,23 @@ class MasterDiscoveryBroadcaster:
 
             await asyncio.sleep(self.interval)
 
-    async def stop(self):
-        self.running = False
-        if self.sock:
+    def _send_blocking(self, packet: bytes, peer_ip: str,
+                        port: int) -> bool:
+        """
+        Отправка UDP через свежий blocking socket.
+        Работает в отдельном потоке (executor).
+        """
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2.0)
             try:
-                self.sock.close()
-            except Exception:
-                pass
+                s.sendto(packet, (peer_ip, port))
+                return True
+            finally:
+                s.close()
+        except Exception as e:
+            print(f"[DISCOVERY] send {peer_ip}: {e}")
+            return False
 
 
 # ═════════════════════════════════════════════════════════════════════
