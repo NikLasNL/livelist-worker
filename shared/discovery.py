@@ -136,15 +136,10 @@ class MasterDiscoveryBroadcaster:
         self.known_peers = []
 
     def _get_peers(self) -> list:
-        """
-        Прочитать актуальные peer-IP из wg-mesh.
-        Формат `wg show wg-mesh allowed-ips`:
-            peer_pubkey<TAB>10.10.0.10/32
-            peer_pubkey2<TAB>10.10.0.11/32 10.10.0.12/32
-        """
+        """Читать peer-IP из wg-mesh (с sudo)."""
         try:
             result = subprocess.run(
-                ["wg", "show", self.wg_interface, "allowed-ips"],
+                ["sudo", "-n", "wg", "show", self.wg_interface, "allowed-ips"],
                 capture_output=True, text=True, timeout=5,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as e:
@@ -152,7 +147,16 @@ class MasterDiscoveryBroadcaster:
             return []
 
         if result.returncode != 0:
-            return []
+            # Попробовать без sudo (если разрешено)
+            try:
+                result = subprocess.run(
+                    ["wg", "show", self.wg_interface, "allowed-ips"],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except Exception:
+                return []
+            if result.returncode != 0:
+                return []
 
         peers = []
         for line in result.stdout.strip().splitlines():
@@ -162,11 +166,9 @@ class MasterDiscoveryBroadcaster:
             for cidr in parts[1].split():
                 if "/32" in cidr:
                     ip = cidr.split("/")[0].strip()
-                    # Пропускаем себя
                     if ip and ip != self.wg_addr:
                         peers.append(ip)
 
-        # Дедупликация
         return sorted(set(peers))
 
     async def start(self):
