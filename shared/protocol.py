@@ -81,6 +81,9 @@ class MsgType:
     KEY_ROTATE_NEW = "key_rotate_new"
     KEY_ROTATE_ACK = "key_rotate_ack"
     KEY_ROTATE_DONE = "key_rotate_done"
+        # ─── Discovery (control) ─────────────────────────────────────
+    DISCOVERY_PING = "discovery_ping"
+    DISCOVERY_PONG = "discovery_pong"
 
 
 MAX_PACKET = 16 * 1024 * 1024
