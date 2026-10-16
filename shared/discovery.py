@@ -1,18 +1,16 @@
 """
-shared/discovery.py — Auto-discovery мастера через UDP unicast.
+shared/discovery.py — Auto-discovery + health-check.
 
-ВАЖНО: WireGuard — point-to-point, broadcast НЕ поддерживается.
-Поэтому master рассылает ANNOUNCE unicast'ом на каждый peer
-из `wg show wg-mesh allowed-ips`.
+Discovery: unicast ANNOUNCE на WG peers (не broadcast — WG его не умеет).
+Health-check: ping всех известных peer'ов.
 
-Формат пакета:
-  MAGIC(4) || VER(1) || TYPE(1) || NONCE(32) || TS(8) ||
-  wg_addr_len(2) || wg_addr || hostname_len(2) || hostname || HMAC(32)
+Регистрация новых воркеров — через TCP enrollment, не через scan.
 """
 
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import os
 import socket
 import struct
@@ -26,71 +24,55 @@ MAGIC = b"LLMD"
 VERSION = 1
 DEFAULT_PORT = 9051
 MAX_AGE_SECONDS = 30
+WG_INTERFACE = "wg-mesh"
 
 TYPE_ANNOUNCE = 0x01
-TYPE_QUERY = 0x02
-TYPE_RESPONSE = 0x03
-
-WG_INTERFACE = "wg-mesh"
+TYPE_PING = 0x02
+TYPE_PONG = 0x03
 
 
 # ═════════════════════════════════════════════════════════════════════
-# Crypto helpers
+# PSK
 # ═════════════════════════════════════════════════════════════════════
 
 def derive_discovery_psk(secret) -> bytes:
-    """
-    PSK для discovery.
-    secret — bytes (CA private) или str (bootstrap token).
-    """
     if isinstance(secret, str):
         secret = secret.encode()
-
     if not secret:
         raise ValueError("Empty secret")
-
     prk = hmac.new(b"\x00" * 32, secret, hashlib.sha256).digest()
-    return hmac.new(
-        prk, b"discovery-psk-v1" + b"\x01", hashlib.sha256
-    ).digest()
+    return hmac.new(prk, b"discovery-psk-v1" + b"\x01",
+                     hashlib.sha256).digest()
 
+
+# ═════════════════════════════════════════════════════════════════════
+# Packet
+# ═════════════════════════════════════════════════════════════════════
 
 def _build_packet(msg_type: int, psk: bytes,
                     wg_addr: str = "", hostname: str = "") -> bytes:
     nonce = os.urandom(32)
     ts = int(time.time()).to_bytes(8, "big")
-
     wg_b = wg_addr.encode()
     hn_b = hostname.encode()
 
     header = (
-        MAGIC
-        + bytes([VERSION, msg_type])
-        + nonce
-        + ts
+        MAGIC + bytes([VERSION, msg_type])
+        + nonce + ts
         + struct.pack(">H", len(wg_b)) + wg_b
         + struct.pack(">H", len(hn_b)) + hn_b
     )
-
     sig = hmac.new(psk, header, hashlib.sha256).digest()
     return header + sig
 
 
 def _parse_packet(data: bytes, psk: bytes) -> Optional[dict]:
-    min_len = 4 + 2 + 32 + 8 + 2 + 2 + 32
-    if len(data) < min_len:
-        return None
-    if data[:4] != MAGIC:
-        return None
-
-    ver = data[4]
-    if ver != VERSION:
+    if len(data) < 80 or data[:4] != MAGIC or data[4] != VERSION:
         return None
 
     msg_type = data[5]
     nonce = data[6:38]
     ts = int.from_bytes(data[38:46], "big")
-
     if abs(time.time() - ts) > MAX_AGE_SECONDS:
         return None
 
@@ -110,17 +92,58 @@ def _parse_packet(data: bytes, psk: bytes) -> Optional[dict]:
 
     sig = data[offset:offset + 32]
     expected = hmac.new(psk, data[:offset], hashlib.sha256).digest()
-
     if not hmac.compare_digest(sig, expected):
         return None
 
     return {
-        "type": msg_type,
-        "nonce": nonce,
-        "ts": ts,
-        "wg_addr": wg_addr,
-        "hostname": hostname,
+        "type": msg_type, "nonce": nonce, "ts": ts,
+        "wg_addr": wg_addr, "hostname": hostname,
     }
+
+
+# ═════════════════════════════════════════════════════════════════════
+# UDP send (надёжный, blocking в executor)
+# ═════════════════════════════════════════════════════════════════════
+
+def _send_udp_blocking(packet: bytes, peer_ip: str,
+                         port: int, timeout: float = 2.0) -> tuple:
+    """
+    Отправка UDP через connect+send.
+    Возвращает (ok, error_msg).
+    """
+    import ipaddress
+
+    peer_ip_clean = str(peer_ip).strip()
+    try:
+        ipaddress.IPv4Address(peer_ip_clean)
+    except Exception as e:
+        return False, f"invalid IP {peer_ip!r}: {e}"
+
+    try:
+        port_int = int(port)
+        if not (1 <= port_int <= 65535):
+            return False, f"invalid port {port!r}"
+    except Exception as e:
+        return False, f"invalid port {port!r}: {e}"
+
+    if not isinstance(packet, (bytes, bytearray)):
+        return False, f"packet not bytes: {type(packet)}"
+    if len(packet) == 0 or len(packet) > 65507:
+        return False, f"packet size {len(packet)}"
+
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            # ⭐ Ключевой fix: connect вместо sendto
+            s.connect((peer_ip_clean, port_int))
+            n = s.send(bytes(packet))
+            if n != len(packet):
+                return False, f"sent {n}/{len(packet)}"
+            return True, ""
+        finally:
+            s.close()
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -128,11 +151,6 @@ def _parse_packet(data: bytes, psk: bytes) -> Optional[dict]:
 # ═════════════════════════════════════════════════════════════════════
 
 class MasterDiscoveryBroadcaster:
-    """
-    Master рассылает ANNOUNCE unicast'ом на peer-IP из wg-mesh.
-    Peer list читается каждые `interval` секунд.
-    """
-
     def __init__(self, psk: bytes,
                  wg_addr: str = "10.10.0.1",
                  hostname: str = "",
@@ -146,20 +164,15 @@ class MasterDiscoveryBroadcaster:
         self.port = port
         self.interval = interval
         self.running = False
-        self.sock = None
         self.known_peers = []
 
     # ─── Read WG peer list ────────────────────────────────────────
 
     def _get_peers(self) -> list:
-        """
-        Список peer-IP в wg-mesh.
-        Пробует сначала sudo -n (без пароля через sudoers),
-        затем без sudo.
-        """
+        """Список peer-IP в wg-mesh (с sanitize)."""
         result = None
 
-        # Попытка 1: sudo -n
+        # sudo -n
         try:
             result = subprocess.run(
                 ["sudo", "-n", "wg", "show",
@@ -169,7 +182,7 @@ class MasterDiscoveryBroadcaster:
         except (FileNotFoundError, subprocess.TimeoutExpired):
             result = None
 
-        # Попытка 2: без sudo
+        # fallback без sudo
         if result is None or result.returncode != 0:
             try:
                 result = subprocess.run(
@@ -179,42 +192,56 @@ class MasterDiscoveryBroadcaster:
             except Exception:
                 return []
 
-        if result.returncode != 0:
+        if result is None or result.returncode != 0:
             return []
 
-        peers = []
+        peers = set()
         for line in result.stdout.strip().splitlines():
-            # Формат: "<peer_pubkey>\t<ip1>/32 <ip2>/32 ..."
-            parts = line.split("\t")
-            if len(parts) < 2:
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                allowed = parts[1:]
-            else:
-                allowed = parts[1].split()
+            line = line.strip()
+            if not line:
+                continue
 
-            for cidr in allowed:
+            # Формат: "<pubkey>\t<ip1>/32 <ip2>/32"
+            # или:    "<pubkey>  <ip1>/32"
+            parts = line.replace("\t", " ").split()
+            if len(parts) < 2:
+                continue
+
+            # parts[0] = pubkey, остальное = CIDRs
+            for cidr in parts[1:]:
                 if "/32" in cidr:
                     ip = cidr.split("/")[0].strip()
-                    if ip and ip != self.wg_addr:
-                        peers.append(ip)
+                    try:
+                        ipaddress.IPv4Address(ip)
+                    except Exception:
+                        continue
+                    if ip != self.wg_addr:
+                        peers.add(ip)
 
-        return sorted(set(peers))
+        return sorted(peers)
+
+    # ─── Send one packet ──────────────────────────────────────────
+
+    async def _send_to_peer(self, peer_ip: str, packet: bytes) -> bool:
+        loop = asyncio.get_event_loop()
+        ok, err = await loop.run_in_executor(
+            None, _send_udp_blocking, packet, peer_ip, self.port,
+        )
+        if ok:
+            print(f"[DISCOVERY] → {peer_ip}:{self.port}")
+        else:
+            print(f"[DISCOVERY] ✗ {peer_ip}: {err}")
+        return ok
 
     # ─── Main loop ────────────────────────────────────────────────
 
     async def start(self):
         self.running = True
-
-        print(f"[DISCOVERY] Unicast broadcaster started")
+        print(f"[DISCOVERY] Broadcaster started")
         print(f"[DISCOVERY] wg_iface={self.wg_interface} "
-              f"self_wg={self.wg_addr}")
-        print(f"[DISCOVERY] interval={self.interval}s port={self.port}")
+              f"self_wg={self.wg_addr} port={self.port}")
 
-        loop = asyncio.get_event_loop()
         first = True
-
         while self.running:
             try:
                 peers = self._get_peers()
@@ -232,15 +259,7 @@ class MasterDiscoveryBroadcaster:
                         self.wg_addr, self.hostname,
                     )
                     for peer_ip in peers:
-                        # Используем blocking socket в executor — надёжнее
-                        ok = await loop.run_in_executor(
-                            None,
-                            self._send_blocking,
-                            packet, peer_ip, self.port,
-                        )
-                        if ok:
-                            print(f"[DISCOVERY] → {peer_ip}:{self.port}")
-
+                        await self._send_to_peer(peer_ip, packet)
                 elif first:
                     print("[DISCOVERY] waiting for peers...")
                     first = False
@@ -250,23 +269,8 @@ class MasterDiscoveryBroadcaster:
 
             await asyncio.sleep(self.interval)
 
-    def _send_blocking(self, packet: bytes, peer_ip: str,
-                        port: int) -> bool:
-        """
-        Отправка UDP через свежий blocking socket.
-        Работает в отдельном потоке (executor).
-        """
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(2.0)
-            try:
-                s.sendto(packet, (peer_ip, port))
-                return True
-            finally:
-                s.close()
-        except Exception as e:
-            print(f"[DISCOVERY] send {peer_ip}: {e}")
-            return False
+    async def stop(self):
+        self.running = False
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -274,11 +278,6 @@ class MasterDiscoveryBroadcaster:
 # ═════════════════════════════════════════════════════════════════════
 
 class WorkerDiscoveryListener:
-    """
-    Слушает UDP :9051.
-    При валидном ANNOUNCE — вызывает on_master_found().
-    """
-
     def __init__(self, psk: bytes,
                  on_master_found: Callable,
                  port: int = DEFAULT_PORT):
@@ -297,7 +296,7 @@ class WorkerDiscoveryListener:
         try:
             self.sock.bind(("0.0.0.0", self.port))
         except OSError as e:
-            print(f"[DISCOVERY] Cannot bind :{self.port} — {e}")
+            print(f"[DISCOVERY] cannot bind :{self.port} — {e}")
             return
 
         self.sock.setblocking(False)
@@ -309,33 +308,27 @@ class WorkerDiscoveryListener:
                 data, addr = await loop.sock_recvfrom(self.sock, 4096)
                 src_ip = addr[0]
                 parsed = _parse_packet(data, self.psk)
-
                 if not parsed or parsed["type"] != TYPE_ANNOUNCE:
                     continue
 
                 new = (src_ip, parsed["wg_addr"])
                 if new != self.last_master:
                     self.last_master = new
-                    print(f"[DISCOVERY] Master found: {src_ip} "
-                          f"(wg={parsed['wg_addr']}, "
-                          f"host={parsed['hostname']})")
+                    print(f"[DISCOVERY] Master: {src_ip} "
+                          f"(wg={parsed['wg_addr']})")
                     try:
                         await self.on_master_found(
                             src_ip, parsed["wg_addr"]
                         )
                     except Exception as e:
                         print(f"[DISCOVERY] callback: {e}")
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[DISCOVERY] recv error: {e}")
+                print(f"[DISCOVERY] recv: {e}")
                 await asyncio.sleep(1)
 
     async def stop(self):
         self.running = False
         if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
+            self.sock.close()
