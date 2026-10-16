@@ -1,12 +1,12 @@
 """
 shared/discovery.py — Auto-discovery мастера через UDP unicast.
 
-WireGuard НЕ поддерживает broadcast (он point-to-point).
-Поэтому master рассылает ANNOUNCE-пакеты unicast'ом на каждый peer
+ВАЖНО: WireGuard — point-to-point, broadcast НЕ поддерживается.
+Поэтому master рассылает ANNOUNCE unicast'ом на каждый peer
 из `wg show wg-mesh allowed-ips`.
 
-Пакет:
-  MAGIC(4) || ver(1) || type(1) || nonce(32) || ts(8) ||
+Формат пакета:
+  MAGIC(4) || VER(1) || TYPE(1) || NONCE(32) || TS(8) ||
   wg_addr_len(2) || wg_addr || hostname_len(2) || hostname || HMAC(32)
 """
 
@@ -21,6 +21,7 @@ import time
 from typing import Optional, Callable
 
 
+# ─── Константы ────────────────────────────────────────────────────
 MAGIC = b"LLMD"
 VERSION = 1
 DEFAULT_PORT = 9051
@@ -30,7 +31,6 @@ TYPE_ANNOUNCE = 0x01
 TYPE_QUERY = 0x02
 TYPE_RESPONSE = 0x03
 
-# WG-интерфейс для чтения peers
 WG_INTERFACE = "wg-mesh"
 
 
@@ -38,13 +38,21 @@ WG_INTERFACE = "wg-mesh"
 # Crypto helpers
 # ═════════════════════════════════════════════════════════════════════
 
-def derive_discovery_psk(secret: bytes) -> bytes:
-    """HKDF от CA-private (master) или bootstrap token (worker)."""
+def derive_discovery_psk(secret) -> bytes:
+    """
+    PSK для discovery.
+    secret — bytes (CA private) или str (bootstrap token).
+    """
+    if isinstance(secret, str):
+        secret = secret.encode()
+
     if not secret:
         raise ValueError("Empty secret")
+
     prk = hmac.new(b"\x00" * 32, secret, hashlib.sha256).digest()
-    return hmac.new(prk, b"discovery-psk-v1" + b"\x01",
-                     hashlib.sha256).digest()
+    return hmac.new(
+        prk, b"discovery-psk-v1" + b"\x01", hashlib.sha256
+    ).digest()
 
 
 def _build_packet(msg_type: int, psk: bytes,
@@ -70,7 +78,9 @@ def _build_packet(msg_type: int, psk: bytes,
 
 def _parse_packet(data: bytes, psk: bytes) -> Optional[dict]:
     min_len = 4 + 2 + 32 + 8 + 2 + 2 + 32
-    if len(data) < min_len or data[:4] != MAGIC:
+    if len(data) < min_len:
+        return None
+    if data[:4] != MAGIC:
         return None
 
     ver = data[4]
@@ -95,8 +105,12 @@ def _parse_packet(data: bytes, psk: bytes) -> Optional[dict]:
     hostname = data[offset:offset + hn_len].decode(errors="replace")
     offset += hn_len
 
+    if len(data) < offset + 32:
+        return None
+
     sig = data[offset:offset + 32]
     expected = hmac.new(psk, data[:offset], hashlib.sha256).digest()
+
     if not hmac.compare_digest(sig, expected):
         return None
 
@@ -110,13 +124,13 @@ def _parse_packet(data: bytes, psk: bytes) -> Optional[dict]:
 
 
 # ═════════════════════════════════════════════════════════════════════
-# MASTER: Unicast broadcaster
+# MASTER: unicast broadcaster
 # ═════════════════════════════════════════════════════════════════════
 
 class MasterDiscoveryBroadcaster:
     """
-    Master рассылает ANNOUNCE unicast'ом на каждый peer WG.
-    Список peer'ов обновляется каждые N секунд через `wg show`.
+    Master рассылает ANNOUNCE unicast'ом на peer-IP из wg-mesh.
+    Peer list читается каждые `interval` секунд.
     """
 
     def __init__(self, psk: bytes,
@@ -135,19 +149,28 @@ class MasterDiscoveryBroadcaster:
         self.sock = None
         self.known_peers = []
 
+    # ─── Read WG peer list ────────────────────────────────────────
+
     def _get_peers(self) -> list:
-        """Читать peer-IP из wg-mesh (с sudo)."""
+        """
+        Список peer-IP в wg-mesh.
+        Пробует сначала sudo -n (без пароля через sudoers),
+        затем без sudo.
+        """
+        result = None
+
+        # Попытка 1: sudo -n
         try:
             result = subprocess.run(
-                ["sudo", "-n", "wg", "show", self.wg_interface, "allowed-ips"],
+                ["sudo", "-n", "wg", "show",
+                 self.wg_interface, "allowed-ips"],
                 capture_output=True, text=True, timeout=5,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            print(f"[DISCOVERY] wg not available: {e}")
-            return []
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            result = None
 
-        if result.returncode != 0:
-            # Попробовать без sudo (если разрешено)
+        # Попытка 2: без sudo
+        if result is None or result.returncode != 0:
             try:
                 result = subprocess.run(
                     ["wg", "show", self.wg_interface, "allowed-ips"],
@@ -155,21 +178,31 @@ class MasterDiscoveryBroadcaster:
                 )
             except Exception:
                 return []
-            if result.returncode != 0:
-                return []
+
+        if result.returncode != 0:
+            return []
 
         peers = []
         for line in result.stdout.strip().splitlines():
+            # Формат: "<peer_pubkey>\t<ip1>/32 <ip2>/32 ..."
             parts = line.split("\t")
             if len(parts) < 2:
-                continue
-            for cidr in parts[1].split():
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                allowed = parts[1:]
+            else:
+                allowed = parts[1].split()
+
+            for cidr in allowed:
                 if "/32" in cidr:
                     ip = cidr.split("/")[0].strip()
                     if ip and ip != self.wg_addr:
                         peers.append(ip)
 
         return sorted(set(peers))
+
+    # ─── Main loop ────────────────────────────────────────────────
 
     async def start(self):
         self.running = True
@@ -179,28 +212,23 @@ class MasterDiscoveryBroadcaster:
         print(f"[DISCOVERY] Unicast broadcaster started")
         print(f"[DISCOVERY] wg_iface={self.wg_interface} "
               f"self_wg={self.wg_addr}")
-        print(f"[DISCOVERY] interval={self.interval}s  port={self.port}")
+        print(f"[DISCOVERY] interval={self.interval}s port={self.port}")
 
         loop = asyncio.get_event_loop()
-        first_run = True
+        first = True
 
         while self.running:
             try:
                 peers = self._get_peers()
 
-                # Логируем изменения в peer list
                 if peers != self.known_peers:
+                    self.known_peers = peers
                     if peers:
                         print(f"[DISCOVERY] peers: {', '.join(peers)}")
-                    else:
-                        print("[DISCOVERY] no peers in wg-mesh yet")
-                    self.known_peers = peers
+                    elif not first:
+                        print("[DISCOVERY] no peers in wg-mesh")
 
-                if not peers:
-                    if first_run:
-                        print("[DISCOVERY] waiting for peers...")
-                        first_run = False
-                else:
+                if peers:
                     packet = _build_packet(
                         TYPE_ANNOUNCE, self.psk,
                         self.wg_addr, self.hostname,
@@ -213,10 +241,13 @@ class MasterDiscoveryBroadcaster:
                             )
                             print(f"[DISCOVERY] → {peer_ip}:{self.port}")
                         except Exception as e:
-                            print(f"[DISCOVERY] send to {peer_ip}: {e}")
+                            print(f"[DISCOVERY] send {peer_ip}: {e}")
+                elif first:
+                    print("[DISCOVERY] waiting for peers...")
+                    first = False
 
             except Exception as e:
-                print(f"[DISCOVERY] Broadcast error: {e}")
+                print(f"[DISCOVERY] loop error: {e}")
 
             await asyncio.sleep(self.interval)
 
@@ -230,13 +261,13 @@ class MasterDiscoveryBroadcaster:
 
 
 # ═════════════════════════════════════════════════════════════════════
-# WORKER: Listener
+# WORKER: listener
 # ═════════════════════════════════════════════════════════════════════
 
 class WorkerDiscoveryListener:
     """
-    Worker слушает UDP :9051.
-    При получении валидного ANNOUNCE — вызывает on_master_found().
+    Слушает UDP :9051.
+    При валидном ANNOUNCE — вызывает on_master_found().
     """
 
     def __init__(self, psk: bytes,
@@ -261,14 +292,15 @@ class WorkerDiscoveryListener:
             return
 
         self.sock.setblocking(False)
-        print(f"[DISCOVERY] Listener started on 0.0.0.0:{self.port}")
+        print(f"[DISCOVERY] Listener on 0.0.0.0:{self.port}")
 
         loop = asyncio.get_event_loop()
         while self.running:
             try:
-                data, addr = await loop.sock_recvfrom(self.sock, 2048)
+                data, addr = await loop.sock_recvfrom(self.sock, 4096)
                 src_ip = addr[0]
                 parsed = _parse_packet(data, self.psk)
+
                 if not parsed or parsed["type"] != TYPE_ANNOUNCE:
                     continue
 
@@ -283,12 +315,12 @@ class WorkerDiscoveryListener:
                             src_ip, parsed["wg_addr"]
                         )
                     except Exception as e:
-                        print(f"[DISCOVERY] Callback error: {e}")
+                        print(f"[DISCOVERY] callback: {e}")
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"[DISCOVERY] Recv error: {e}")
+                print(f"[DISCOVERY] recv error: {e}")
                 await asyncio.sleep(1)
 
     async def stop(self):
